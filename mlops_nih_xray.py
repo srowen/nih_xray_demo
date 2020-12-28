@@ -493,3 +493,9 @@ pd.DataFrame(torch.sigmoid(model(transforms(image).unsqueeze(dim=0))).detach().n
 # MAGIC ## Managing Notebooks with Projects
 # MAGIC 
 # MAGIC This notebook exists within a Project. This means it and any related notebooks are backed by a Git repository. The notebook can be committed, along with other notebooks, and observed in the source Git repository.
+
+# COMMAND ----------
+
+# MAGIC %md 
+# MAGIC 
+# MAGIC ### TODO
