@@ -114,7 +114,7 @@ metadata_df.join(image_df, metadata_df["Image Index"] == image_df["origin"]).dro
 # MAGIC 
 # MAGIC [PyTorch](https://pytorch.org/) is of course one of the most popular tools for building deep learning models, and is well suited to build a convolutional neural net that works well as a multi-label classifier for these images. Below, other related tools like `torchvision` and [PyTorch Lightning](https://www.pytorchlightning.ai/) are used to simplify expressing and building the classifier.
 # MAGIC 
-# MAGIC The data set isn't that large once preprocessed - about 2.2GB. For simplicity, the data will be loaded and manipulated with `pandas` from the Delta table, and model trained on one GPU.
+# MAGIC The data set isn't that large once preprocessed - about 2.2GB. For simplicity, the data will be loaded and manipulated with `pandas` from the Delta table, and model trained on one GPU. It's also quite possible to scale to multiple GPUs, or scale across machines with Spark and Horovod, but it won't be necessary to add that complexity in this example.
 
 # COMMAND ----------
 
@@ -382,6 +382,7 @@ with open(image_path, "rb") as file:
   content = file.read()
 
 dataset = pd.DataFrame([base64.encodebytes(content)], columns=["image"])
+# Note that you will still need a Databricks access token to send with the request. This can/should be stored as a secret in the workspace:
 token = dbutils.secrets.get("demo-token-sean.owen", "token")
 
 response = requests.request(method='POST',
@@ -403,6 +404,8 @@ pd.DataFrame(response.json())
 # MAGIC ## Adding Webhooks for Model State Management
 # MAGIC 
 # MAGIC MLflow can now trigger webhooks when Model Registry events happen. Webhooks are standard 'callbacks' which let applications signal one another. For example, a webhook can cause a CI/CD test job to start and run tests on a model. In this simple example, we'll just set up a webhook that posts a message to a Slack channel.
+# MAGIC 
+# MAGIC _Note_: the example below requires a [registered Slack webhook](https://api.slack.com/messaging/webhooks). Because the webhook URL is sensitive, it is stored as a secret in the workspace and not included inline.
 
 # COMMAND ----------
 
