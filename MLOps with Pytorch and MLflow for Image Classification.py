@@ -4,13 +4,15 @@
 # MAGIC 
 # MAGIC This simple example will demonstrate how to build a chest X-Ray classifer with PyTorch Lightning, and explain its output, but more importantly, will demonstrate how to manage the model's deployment to production as a REST service with MLflow and its Model Registry.
 # MAGIC 
+# MAGIC <img src="https://databricks-knowledge-repo-images.s3.us-east-2.amazonaws.com/ML/nih_xray/shap.png" width="600"/>
+# MAGIC 
 # MAGIC The National Institute of Health (NIH) [released a dataset](https://www.nih.gov/news-events/news-releases/nih-clinical-center-provides-one-largest-publicly-available-chest-x-ray-datasets-scientific-community) of 45,000 chest X-rays of patients who may suffer from some problem in the chest cavity, along with several of 14 possible diagnoses. This was accompanied by a [paper](https://openaccess.thecvf.com/content_cvpr_2017/papers/Wang_ChestX-ray8_Hospital-Scale_Chest_CVPR_2017_paper.pdf) analyzing the data set and presenting a classification model.
 # MAGIC 
 # MAGIC The task here is to train a classifier that learns to predict these diagnoses. Note that each image may have 0 or several 'labels'. This data set was the subject of a [Kaggle competition](https://www.kaggle.com/nih-chest-xrays/data) as well.
 
 # COMMAND ----------
 
-# MAGIC %pip install pytorch-lightning shap
+# MAGIC %pip install pytorch-lightning shap mlflow==1.13.1
 
 # COMMAND ----------
 
@@ -19,7 +21,7 @@
 # MAGIC 
 # MAGIC The image data is provided as a series of [compressed archives](https://nihcc.app.box.com/v/ChestXray-NIHCC). However they are also available [from Kaggle](https://www.kaggle.com/nih-chest-xrays/data) with other useful information, like labels and bounding boxes. In this problem, only the images will be used, unpacked into an `.../images/` directory,, and the CSV file of label information `Data_Entry_2017.csv` at a `.../metadata/` path.
 # MAGIC 
-# MAGIC The images can be read directly and browsed with Spark:
+# MAGIC The images can be read directly and browsed with Apache Spark:
 
 # COMMAND ----------
 
@@ -30,12 +32,12 @@ display(raw_image_df)
 
 # MAGIC %md
 # MAGIC 
-# MAGIC ### Managing Unstructured Data with Delta
+# MAGIC ### Managing Unstructured Data with Delta Lake
 # MAGIC 
-# MAGIC Although the images can be read directly as files, it will be useful to manage the data as a Delta table:
+# MAGIC Although the images can be read directly as files, it will be useful to manage the data as a [Delta](https://delta.io/) table:
 # MAGIC 
 # MAGIC - Delta provides transactional updates, so that the data set can be updated, and still read safely while being updated
-# MAGIC - Delta provides "time travel" to view previous states of the data set
+# MAGIC - Delta provides ["time travel"](https://docs.delta.io/latest/quick-start.html#read-older-versions-of-data-using-time-travel) to view previous states of the data set
 # MAGIC - Reading batches of image data is more efficient from Delta than from many small files
 # MAGIC - The image data needs some one-time preprocessing beforehand anyway
 # MAGIC 
@@ -57,14 +59,14 @@ def to_grayscale(data, channels):
     grayscale = (0.0722 * reshaped[:,:,0] + 0.7152 * reshaped[:,:,1] + 0.2126 * reshaped[:,:,2]).astype(np.uint8)
   # Use PIL to resize to match DL model that it will feed
   resized = Image.frombytes('L', (1024,1024), grayscale).resize((224,224), resample=Image.LANCZOS)
-  # Flatten result into a bytearray
   return np.asarray(resized, dtype=np.uint8).flatten().tobytes()
 
 to_grayscale_udf = udf(to_grayscale, BinaryType())
-
 to_filename_udf = udf(lambda f: f.split("/")[-1], StringType())
 
-image_df = raw_image_df.select(to_filename_udf("image.origin").alias("origin"), to_grayscale_udf("image.data", "image.nChannels").alias("image"))
+image_df = raw_image_df.select(
+  to_filename_udf("image.origin").alias("origin"),
+  to_grayscale_udf("image.data", "image.nChannels").alias("image"))
 
 # COMMAND ----------
 
@@ -86,7 +88,6 @@ from pyspark.sql.functions import explode, split
 from pyspark.sql.types import BooleanType, StructType, StructField
 
 distinct_findings = sorted([r["col"] for r in raw_metadata_df.select(explode(split("Finding Labels", r"\|"))).distinct().collect() if r["col"] != "No Finding"])
-
 encode_findings_schema = StructType([StructField(f.replace(" ", "_"), BooleanType(), False) for f in distinct_findings])
 
 def encode_finding(raw_findings):
@@ -98,7 +99,8 @@ encode_finding_udf = udf(encode_finding, encode_findings_schema)
 metadata_df = raw_metadata_df.withColumn("encoded_findings", encode_finding_udf("Finding Labels")).select("Image Index", "encoded_findings.*")
 
 table_path = "/tmp/sean.owen/image_table/"
-metadata_df.join(image_df, metadata_df["Image Index"] == image_df["origin"]).drop("Image Index", "origin").write.mode("overwrite").format("delta").save(table_path)
+metadata_df.join(image_df, metadata_df["Image Index"] == image_df["origin"]).drop("Image Index", "origin").
+  write.mode("overwrite").format("delta").save(table_path)
 
 # COMMAND ----------
 
@@ -112,9 +114,9 @@ metadata_df.join(image_df, metadata_df["Image Index"] == image_df["origin"]).dro
 # MAGIC %md
 # MAGIC ## Modeling with PyTorch Lightning and MLflow
 # MAGIC 
-# MAGIC [PyTorch](https://pytorch.org/) is of course one of the most popular tools for building deep learning models, and is well suited to build a convolutional neural net that works well as a multi-label classifier for these images. Below, other related tools like `torchvision` and [PyTorch Lightning](https://www.pytorchlightning.ai/) are used to simplify expressing and building the classifier.
+# MAGIC [PyTorch](https://pytorch.org/) is of course one of the most popular tools for building deep learning models, and is well suited to build a convolutional neural net that works well as a multi-label classifier for these images. Below, other related tools like [`torchvision`](https://pytorch.org/docs/stable/torchvision/index.html) and [PyTorch Lightning](https://www.pytorchlightning.ai/) are used to simplify expressing and building the classifier.
 # MAGIC 
-# MAGIC The data set isn't that large once preprocessed - about 2.2GB. For simplicity, the data will be loaded and manipulated with `pandas` from the Delta table, and model trained on one GPU. It's also quite possible to scale to multiple GPUs, or scale across machines with Spark and Horovod, but it won't be necessary to add that complexity in this example.
+# MAGIC The data set isn't that large once preprocessed - about 2.2GB. For simplicity, the data will be loaded and manipulated with [`pandas`](https://pandas.pydata.org/) from the Delta table, and model trained on one GPU. It's also quite possible to scale to multiple GPUs, or scale across machines with Spark and [Horovod](https://github.com/horovod/horovod), but it won't be necessary to add that complexity in this example.
 
 # COMMAND ----------
 
@@ -173,7 +175,7 @@ test_loader = DataLoader(XRayDataset(test_pd, transforms), batch_size=64, num_wo
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Note that MLflow natively supports logging PyTorch models of course, but, can also automatically log the output of models defined with PyTorch Lightning:
+# MAGIC Note that [MLflow](https://mlflow.org/) natively supports [logging PyTorch models](https://mlflow.org/docs/latest/python_api/mlflow.pytorch.html#module-mlflow.pytorch) of course, but, can also automatically log the output of models defined with PyTorch Lightning:
 
 # COMMAND ----------
 
@@ -244,10 +246,10 @@ model = XRayNNLightning(learning_rate=0.001, pos_weights=[[1.0 / frac_positive] 
 
 # Let PyTorch handle learning rate, batch size tuning, as well as early stopping.
 # Change here to configure for CPUs or TPUs.
-trainer = pl.Trainer(gpus=1, max_epochs=100, 
+trainer = pl.Trainer(gpus=1, max_epochs=20, 
                      auto_scale_batch_size='binsearch',
                      auto_lr_find=True,
-                     callbacks=[EarlyStopping(monitor='val_loss', patience=5, verbose=True)])
+                     callbacks=[EarlyStopping(monitor='val_loss', patience=3, verbose=True)])
 trainer.fit(model, train_loader, test_loader)
 
 # COMMAND ----------
@@ -256,6 +258,13 @@ trainer.fit(model, train_loader, test_loader)
 # MAGIC Although not shown here for brevity, this model's results are comparable to those cited in the [paper](https://openaccess.thecvf.com/content_cvpr_2017/papers/Wang_ChestX-ray8_Hospital-Scale_Chest_CVPR_2017_paper.pdf) - about 0.6-0.7 AUC for each of the 14 classes. The auto-logged results are available in MLflow:
 # MAGIC 
 # MAGIC <img src="https://databricks-knowledge-repo-images.s3.us-east-2.amazonaws.com/ML/nih_xray/pytorch_params.png" width="600"/> <img src="https://databricks-knowledge-repo-images.s3.us-east-2.amazonaws.com/ML/nih_xray/pytorch_artifacts.png" width="600"/>
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### PSA: Don't Try (To Diagnose Chest X-rays) At Home!
+# MAGIC 
+# MAGIC The author is not a doctor, and probably neither are you! It should be said that this is _not_ necessarily the best model, and certainly should not be used to actually diagnose patients! It's just an example.
 
 # COMMAND ----------
 
@@ -269,7 +278,7 @@ trainer.fit(model, train_loader, test_loader)
 # MAGIC - It accepts images as input, but these can't be directly specified in the JSON request to the REST API
 # MAGIC - Its output are logits, when probabilities (and label names) would be more useful
 # MAGIC 
-# MAGIC It is however easy to define a custom `PythonModel` that will wrap the PyTorch model and perform additional pre- and post-processing. This model accepts a base64-encoded image file, and returns the probability each label:
+# MAGIC It is however easy to define a custom `PythonModel` that will wrap the PyTorch model and perform additional pre- and post-processing. This model accepts a base64-encoded image file, and returns the probability of each label:
 
 # COMMAND ----------
 
@@ -321,7 +330,8 @@ import PIL
 import torchvision
 
 # Load PyTorch Lightning model
-model = mlflow.pytorch.load_model("runs:/fcc38232b1a84b878be1d5877ba206b5/model", map_location='cpu')
+# TODO: replace the run ID with the one created above
+model = mlflow.pytorch.load_model("runs:/b955015aa64f4c689ec21c7beff0ea3b/model", map_location='cpu')
 
 with mlflow.start_run():
   model_env = mlflow.pyfunc.get_default_conda_env()
@@ -342,9 +352,9 @@ with mlflow.start_run():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Registering the Model
+# MAGIC ### Registering the Model with MLflow
 # MAGIC 
-# MAGIC The MLflow Model Registry provides workflow management for the model promotion process, from Staging to Production. The new run created above can be registered directly from the MLflow UI:
+# MAGIC The [MLflow Model Registry](https://databricks.com/product/mlflow-model-registry) provides workflow management for the model promotion process, from Staging to Production. The new run created above can be registered directly from the MLflow UI:
 # MAGIC 
 # MAGIC <img src="https://databricks-knowledge-repo-images.s3.us-east-2.amazonaws.com/ML/nih_xray/register_model.png" width="800"/>
 # MAGIC 
@@ -387,7 +397,7 @@ token = dbutils.secrets.get("demo-token-sean.owen", "token")
 
 response = requests.request(method='POST',
                             headers={'Authorization': f'Bearer {token}'}, 
-                            url='https://demo.cloud.databricks.com/model/nih_xray/2/invocations',
+                            url='https://demo.cloud.databricks.com/model/nih_xray/3/invocations',
                             json=dataset.to_dict(orient='split'))
 pd.DataFrame(response.json())
 
@@ -395,7 +405,7 @@ pd.DataFrame(response.json())
 
 # MAGIC %md
 # MAGIC 
-# MAGIC The model suggests that a doctor might examine this X-ray for Atelectasis and Consolidation, but a Hernia is unlikely, for example.
+# MAGIC The model suggests that a doctor might examine this X-ray for Atelectasis and Infiltration, but a Hernia is unlikely, for example.
 # MAGIC But, why did the model think so? Fortunately there are tools that can explain the model's output in this case, and this will be demonstrated a little later.
 
 # COMMAND ----------
@@ -403,7 +413,7 @@ pd.DataFrame(response.json())
 # MAGIC %md
 # MAGIC ## Adding Webhooks for Model State Management
 # MAGIC 
-# MAGIC MLflow can now trigger webhooks when Model Registry events happen. Webhooks are standard 'callbacks' which let applications signal one another. For example, a webhook can cause a CI/CD test job to start and run tests on a model. In this simple example, we'll just set up a webhook that posts a message to a Slack channel.
+# MAGIC [MLflow can now trigger webhooks](https://databricks.com/blog/2020/11/19/mlflow-model-registry-on-databricks-simplifies-mlops-with-ci-cd-features.html) when Model Registry events happen. Webhooks are standard 'callbacks' which let applications signal one another. For example, a webhook can cause a CI/CD test job to start and run tests on a model. In this simple example, we'll just set up a webhook that posts a message to a Slack channel.
 # MAGIC 
 # MAGIC _Note_: the example below requires a [registered Slack webhook](https://api.slack.com/messaging/webhooks). Because the webhook URL is sensitive, it is stored as a secret in the workspace and not included inline.
 
@@ -434,7 +444,7 @@ mlflow_call_endpoint("registry-webhooks/create", "POST", body=json.dumps(json_ob
 # MAGIC %md
 # MAGIC As model versions are added, transitioned among stages, commented on, etc. a webhook will fire.
 # MAGIC 
-# MAGIC <img src="https://databricks-knowledge-repo-images.s3.us-east-2.amazonaws.com/ML/nih_xray/slack.png" width="600"/>
+# MAGIC <img src="https://databricks-knowledge-repo-images.s3.us-east-2.amazonaws.com/ML/nih_xray/slack.png" width="800"/>
 
 # COMMAND ----------
 
@@ -445,7 +455,7 @@ mlflow_call_endpoint("registry-webhooks/create", "POST", body=json.dumps(json_ob
 # MAGIC 
 # MAGIC In MLflow 1.12 and later, SHAP model explanations can be [logged automatically](https://www.mlflow.org/docs/latest/python_api/mlflow.shap.html):
 # MAGIC 
-# MAGIC <img src="https://www.mlflow.org/docs/latest/_images/shap-ui-screenshot.png" width="600"/>
+# MAGIC <img src="https://www.mlflow.org/docs/latest/_images/shap-ui-screenshot.png" width="800"/>
 # MAGIC 
 # MAGIC However, this model's inputs are not simple scalar features, but an image. SHAP does have tools like `GradExplainer` and `DeepExplainer` that are specifically designed to explain neural nets' classification of images. To use this, we do have to use SHAP manually instead of via MLflow's automated tools. However the result can be, for example, logged with a model in MLflow.
 # MAGIC 
@@ -464,22 +474,24 @@ transforms = pyfunc_model._model_impl.python_model.transforms
 model = pyfunc_model._model_impl.python_model.model
 disease_names = pyfunc_model._model_impl.python_model.disease_names
 
-# Let's pick an example that definitely exhibits some affliction, like Effusion
+# Let's pick an example that definitely exhibits some affliction
 df = spark.read.table("nih_xray.images")
-first_row = df.filter("Effusion").select("image").limit(1).toPandas()
+first_row = df.filter("Infiltration").select("image").limit(1).toPandas()
 image = np.frombuffer(first_row["image"].item(), dtype=np.uint8).reshape((224,224))
 
 # Only need a small sample for explanations
-sample = df.sample(0.05).select("image").toPandas()
+sample = df.sample(0.02).select("image").toPandas()
 sample_tensor = torch.cat([transforms(np.frombuffer(sample["image"].iloc[idx], dtype=np.uint8).reshape((224,224))).unsqueeze(dim=0) for idx in range(len(sample))])
 
 e = shap.GradientExplainer((model, model.densenet.features[6]), sample_tensor, local_smoothing=0.1)
-shap_values, indexes = e.shap_values(transforms(image).unsqueeze(dim=0), ranked_outputs=3, nsamples=500)
+shap_values, indexes = e.shap_values(transforms(image).unsqueeze(dim=0), ranked_outputs=3, nsamples=300)
 
 shap.image_plot(shap_values[0][0].mean(axis=0, keepdims=True),
                 transforms(image).numpy().mean(axis=0, keepdims=True))
 
 # COMMAND ----------
+
+import pandas as pd
 
 pd.DataFrame(torch.sigmoid(model(transforms(image).unsqueeze(dim=0))).detach().numpy(), columns=disease_names).iloc[:,indexes.numpy()[0]]
 
@@ -496,9 +508,5 @@ pd.DataFrame(torch.sigmoid(model(transforms(image).unsqueeze(dim=0))).detach().n
 # MAGIC ## Managing Notebooks with Projects
 # MAGIC 
 # MAGIC This notebook exists within a Project. This means it and any related notebooks are backed by a Git repository. The notebook can be committed, along with other notebooks, and observed in the source Git repository.
-
-# COMMAND ----------
-
-# MAGIC %md 
 # MAGIC 
-# MAGIC ### TODO
+# MAGIC <img src="https://databricks-knowledge-repo-images.s3.us-east-2.amazonaws.com/ML/nih_xray/git.png" width="600"/>
